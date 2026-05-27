@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 import os
 import json
+import re
 
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -34,6 +35,7 @@ WEBHOOK_URL       = f"{RENDER_URL}{WEBHOOK_PATH}"
 
 REGISTERED_FILE   = "/tmp/registered_users.json"
 BANNED_FILE       = "/tmp/banned_users.json"
+QUESTIONS_FILE    = "/tmp/admin_questions.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -44,6 +46,7 @@ bot_stats = {"messages_sent": 0, "alerts_count": 0, "allclear_count": 0, "start_
 AWAITING_NAME    = 1
 AWAITING_PHONE   = 2
 AWAITING_ADDRESS = 3
+AWAITING_QUESTION = 4
 
 # ─── USER MANAGEMENT ───────────────────────────────────────────────────────────
 def load_users(filename):
@@ -55,6 +58,16 @@ def load_users(filename):
 def save_users(filename, users):
     with open(filename, "w") as f:
         json.dump(list(users), f)
+
+def load_questions():
+    if os.path.exists(QUESTIONS_FILE):
+        with open(QUESTIONS_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_questions(questions):
+    with open(QUESTIONS_FILE, "w") as f:
+        json.dump(questions, f)
 
 registered_users = load_users(REGISTERED_FILE)
 banned_users     = load_users(BANNED_FILE)
@@ -74,6 +87,11 @@ def unban_user(uid):
     banned_users.discard(uid)
     save_users(BANNED_FILE, banned_users)
 
+def validate_phone(phone: str) -> bool:
+    """Перевіряє чи номер телефону корректний"""
+    phone = re.sub(r'\D', '', phone)
+    return len(phone) >= 10
+
 # ─── HELPERS ───────────────────────────────────────────────────────────────────
 def now_kyiv():
     return datetime.now(KYIV_TZ)
@@ -90,10 +108,10 @@ def uptime_str():
 
 def greeting():
     h = now_kyiv().hour
-    if 5  <= h < 12: return "Доброго ранку"
-    if 12 <= h < 17: return "Доброго дня"
-    if 17 <= h < 22: return "Доброго вечора"
-    return "Доброї ночі"
+    if 5  <= h < 12: return "🌅 Доброго ранку"
+    if 12 <= h < 17: return "☀️ Доброго дня"
+    if 17 <= h < 22: return "🌅 Доброго вечора"
+    return "🌙 Доброї ночі"
 
 def user_name(update):
     u = update.effective_user
@@ -101,22 +119,23 @@ def user_name(update):
 
 def alert_status_text():
     if alert_active is None: return "⏳ перевіряємо..."
-    return "🔴 ОГОЛОШЕНА" if alert_active else "🟢 не оголошена"
+    return "🔴 АКТИВНА!" if alert_active else "✅ НЕМАЄ"
 
 def is_admin(update):
     return update.effective_user.id in ADMIN_IDS
 
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚨 Статус тривоги",  callback_data="status"),
-         InlineKeyboardButton("🗺 Мапа тривог",      callback_data="map")],
-        [InlineKeyboardButton("🏠 Укриття",          callback_data="shelters"),
-         InlineKeyboardButton("📞 Екстрені номери",  callback_data="emergency")],
-        [InlineKeyboardButton("📜 Правила",          callback_data="rules"),
-         InlineKeyboardButton("🌐 Контакти",         callback_data="contacts")],
-        [InlineKeyboardButton("🔔 Сповіщення",       callback_data="notifications"),
-         InlineKeyboardButton("ℹ️ Про бота",         callback_data="about")],
-        [InlineKeyboardButton("📢 Канал новин",      url="https://t.me/yampilnews")],
+        [InlineKeyboardButton("🚨 СТАТУС ТРИВОГИ",     callback_data="status"),
+         InlineKeyboardButton("🗺️ ЖИВІ КАРТИ",          callback_data="map")],
+        [InlineKeyboardButton("🏠 УКРИТТЯ",             callback_data="shelters"),
+         InlineKeyboardButton("📞 ЕКСТРЕННІ НОМЕРИ",    callback_data="emergency")],
+        [InlineKeyboardButton("📋 ПРАВИЛА ПОВЕДІНКИ",   callback_data="rules"),
+         InlineKeyboardButton("📍 КОНТАКТИ ОТГ",        callback_data="contacts")],
+        [InlineKeyboardButton("🔔 СПОВІЩЕННЯ",          callback_data="notifications"),
+         InlineKeyboardButton("❓ ПИТАННЯ АДМІНУ",      callback_data="ask_question")],
+        [InlineKeyboardButton("📊 ПРО БОТА",            callback_data="about")],
+        [InlineKeyboardButton("📢 КАНАЛ НОВИН",         url="https://t.me/yampilnews")],
     ])
 
 # ─── ALERT API ─────────────────────────────────────────────────────────────────
@@ -134,18 +153,6 @@ async def fetch_alert_status(session):
     except Exception as e:
         log.error("API error: %s", e)
         return alert_active or False
-
-async def fetch_all_alerts(session):
-    headers = {"X-API-Key": ALERT_API_KEY}
-    try:
-        async with session.get(ALERT_API_URL, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-        return [a for a in data.get("alerts", []) if a.get("alert_type") == "air_raid"]
-    except Exception as e:
-        log.error("fetch_all_alerts error: %s", e)
-        return []
 
 async def post_to_channel(bot, text):
     try:
@@ -179,18 +186,23 @@ async def cmd_register(update, ctx):
         await update.message.reply_text("🚫 Реєстрація недоступна.")
         return ConversationHandler.END
     await update.message.reply_text(
-        "📝 Реєстрація на бот моніторингу тривог\n\n"
+        "📝 РЕЄСТРАЦІЯ НА БОТ\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
         "1️⃣ Як тебе звати?"
     )
     return AWAITING_NAME
 
 async def receive_name(update, ctx):
     ctx.user_data["name"] = update.message.text
-    await update.message.reply_text("2️⃣ Твій номер телефону?")
+    await update.message.reply_text("2️⃣ Твій номер телефону?\n\n(Приклад: +380 95 123 45 67)")
     return AWAITING_PHONE
 
 async def receive_phone(update, ctx):
-    ctx.user_data["phone"] = update.message.text
+    phone = update.message.text
+    if not validate_phone(phone):
+        await update.message.reply_text("❌ Невірний номер. Спробуй ще раз.")
+        return AWAITING_PHONE
+    ctx.user_data["phone"] = phone
     await update.message.reply_text("3️⃣ Твоя адреса (селище/вулиця)?")
     return AWAITING_ADDRESS
 
@@ -199,8 +211,9 @@ async def receive_address(update, ctx):
     uid = update.effective_user.id
     register_user(uid)
     await update.message.reply_text(
-        "✅ Дякую! Ти успішно зареєстрований.\n\n"
-        "Тепер маєш доступ до всіх функцій бота.\n\n"
+        "✅ РЕЄСТРАЦІЯ УСПІШНА!\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Ти тепер маєш доступ до всіх функцій.\n\n"
         "Натисни /start щоб розпочати."
     )
     return ConversationHandler.END
@@ -215,90 +228,83 @@ async def cmd_start(update, ctx):
     name   = user_name(update)
     gr     = greeting()
     status = alert_status_text()
-    lines  = [f"{gr}, {name}! 👋", f"\n📍 Тривога в СМТ Ямпіль: {status}"]
+    
+    text = (
+        f"{gr}, {name}! 👋\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📍 СМТ ЯМПІЛЬ\n"
+        f"Шепетівський р-н, Хмельницька обл.\n\n"
+        f"🚨 СТАТУС ТРИВОГИ: {status}\n"
+    )
     if alert_active:
-        lines += ["", "⚠️ Прошу пройти до найближчого укриття!", "Бережіть себе! 🙏"]
-    lines += ["", "Оберіть дію з меню нижче:"]
-    await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
+        text += f"\n⚠️ ПРОШУ ПРОЙТИ ДО УКРИТТЯ!\n🙏 БЕРЕЖІТЬ СЕБЕ!\n"
+    text += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n\nОберіть дію з меню:"
+    
+    await update.message.reply_text(text, reply_markup=main_keyboard())
     bot_stats["messages_sent"] += 1
 
 async def cmd_status(update, ctx):
     if not await check_access(update): return
     status = alert_status_text()
-    lines  = ["🛡 Статус повітряної тривоги",
-              f"📍 Шепетівський р-н (СМТ Ямпіль)",
-              f"🕐 {now_str()}",
-              f"Статус: {status}"]
+    
+    text = (
+        "🛡️ СТАТУС ПОВІТРЯНОЇ ТРИВОГИ\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📍 Шепетівський р-н (СМТ Ямпіль)\n"
+        f"🕐 {now_str()}\n\n"
+        f"⚡ СТАТУС: {status}\n"
+    )
     if alert_active:
-        lines += ["", "⚠️ Прошу пройти до найближчого укриття!", "Бережіть себе! 🙏"]
+        text += f"\n⚠️ ТРИВОГА АКТИВНА!\n"
+        text += f"🏃 Рухайтесь до укриття!\n"
+        text += f"🙏 БЕРЕЖІТЬ СЕБЕ!\n"
+    
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Оновити", callback_data="status"),
-        InlineKeyboardButton("🗺 Мапа", callback_data="map"),
+        InlineKeyboardButton("🔄 ОНОВИТИ", callback_data="status"),
+        InlineKeyboardButton("🗺️ КАРТА", callback_data="map"),
     ]])
     msg = update.message or update.callback_query.message
-    await msg.reply_text("\n".join(lines), reply_markup=kb)
+    await msg.reply_text(text, reply_markup=kb)
 
 async def cmd_map(update, ctx):
     if not await check_access(update): return
-    msg    = update.message or (update.callback_query.message if update.callback_query else None)
+    msg = update.message or (update.callback_query.message if update.callback_query else None)
     status = alert_status_text()
-    caption = (f"🗺 Мапа повітряних тривог України\n"
-               f"🕐 {now_str()}\n"
-               f"📍 СМТ Ямпіль: {status}\n\n"
-               f"🔴 — тривога | 🟢 — спокійно\n\n"
-               f"Актуальна мапа: {MAP_URL}")
+    
+    caption = (
+        f"🗺️ ЖИВІ КАРТИ ТРИВОГ УКРАЇНИ\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🕐 Час оновлення: {now_str()}\n"
+        f"📍 СМТ Ямпіль: {status}\n\n"
+        f"🔴 активна тривога\n"
+        f"🟢 спокійно\n"
+    )
+    
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🌐 Відкрити онлайн", url=MAP_URL),
-        InlineKeyboardButton("🔄 Оновити", callback_data="map"),
+        InlineKeyboardButton("🌐 ОНЛАЙН КАРТА", url=MAP_URL),
+        InlineKeyboardButton("🔄 ОНОВИТИ", callback_data="map"),
     ]])
+    
     try:
         await msg.reply_photo(photo=MAP_IMAGE_URL, caption=caption, reply_markup=kb)
     except Exception:
         await msg.reply_text(caption, reply_markup=kb)
 
-async def cmd_alerts_ua(update, ctx):
-    if not await check_access(update): return
-    msg = update.message
-    await msg.reply_text("⏳ Завантажую список тривог...")
-    session = ctx.bot_data.get("session")
-    if not session:
-        await msg.reply_text("❌ Помилка з'єднання з API")
-        return
-    alerts = await fetch_all_alerts(session)
-    if not alerts:
-        await msg.reply_text("🟢 Наразі активних тривог в Україні немає.")
-        return
-    region_names = {
-        "1":"Вінницька","2":"Волинська","3":"Дніпропетровська",
-        "4":"Донецька","5":"Житомирська","6":"Закарпатська",
-        "7":"Запорізька","8":"Івано-Франківська","9":"Київська",
-        "10":"Кіровоградська","11":"Луганська","12":"Львівська",
-        "13":"Миколаївська","14":"Одеська","15":"Полтавська",
-        "16":"Рівненська","17":"Сумська","18":"Тернопільська",
-        "19":"Харківська","20":"Херсонська","21":"Хмельницька",
-        "22":"Черкаська","23":"Чернівецька","24":"Чернігівська",
-        "25":"м. Київ","31004":"Шепетівський р-н (Хмельницька)",
-    }
-    lines = [f"🚨 Активні тривоги ({now_str()}):\n"]
-    for a in alerts[:20]:
-        uid  = str(a.get("location_uid",""))
-        name = region_names.get(uid, f"Регіон {uid}")
-        lines.append(f"🔴 {name}")
-    lines.append(f"\nВсього: {len(alerts)} регіонів")
-    lines.append(f"\n🗺 {MAP_URL}")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗺 Відкрити мапу", url=MAP_URL)]])
-    await msg.reply_text("\n".join(lines), reply_markup=kb)
-
 async def cmd_shelters(update, ctx):
     if not await check_access(update): return
     text = (
-        "🏠 Найближчі укриття в СМТ Ямпіль:\n\n"
-        "1️⃣ Підвал Ямпільської гімназії\n   📍 вул. Шкільна, 1\n\n"
-        "2️⃣ Підвал Будинку культури\n   📍 вул. Центральна\n\n"
-        "3️⃣ Підвальне приміщення амбулаторії\n   📍 вул. Медична\n\n"
-        "4️⃣ Підвал адміністративного будинку ОТГ\n   📍 вул. Незалежності\n\n"
-        "⚠️ У разі тривоги — рухайтесь до найближчого укриття!\n"
-        "📞 Уточнюйте адреси: 104"
+        "🏠 УКРИТТЯ В СМТ ЯМПІЛЬ\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "1️⃣ Підвал Гімназії\n"
+        "   📍 вул. Шкільна, 1\n\n"
+        "2️⃣ Будинок Культури\n"
+        "   📍 вул. Центральна\n\n"
+        "3️⃣ Амбулаторія\n"
+        "   📍 вул. Медична\n\n"
+        "4️⃣ ОТГ Адмін\n"
+        "   📍 вул. Незалежності\n\n"
+        "⚠️ ПРИ ТРИВОЗІ РУХАЙТЕСЬ \n"
+        "ДО НАЙБЛИЖЧОГО УКРИТТЯ!"
     )
     msg = update.message or update.callback_query.message
     await msg.reply_text(text)
@@ -306,10 +312,15 @@ async def cmd_shelters(update, ctx):
 async def cmd_emergency(update, ctx):
     if not await check_access(update): return
     text = (
-        "📞 Екстрені телефони:\n\n"
-        "🚒 Пожежна: 101\n🚔 Поліція: 102\n"
-        "🚑 Швидка: 103\n🛡 ДСНС: 104\n☎️ Єдиний: 112\n\n"
-        "🇺🇦 Гаряча лінія МО: 1580\n\n"
+        "📞 ЕКСТРЕНІ ТЕЛЕФОНИ\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "🚒 Пожежна: 101\n"
+        "🚔 Поліція: 102\n"
+        "🚑 Швидка: 103\n"
+        "🛡️ ДСНС: 104\n"
+        "☎️ Єдиний: 112\n\n"
+        "🇺🇦 МО Гаряча лінія:\n"
+        "   1580\n\n"
         "📻 Слідкуйте за офіційними джерелами!"
     )
     msg = update.message or update.callback_query.message
@@ -318,20 +329,21 @@ async def cmd_emergency(update, ctx):
 async def cmd_rules(update, ctx):
     if not await check_access(update): return
     text = (
-        "📜 Правила поведінки під час тривоги:\n\n"
-        "1️⃣ Почувши сигнал — негайно припиніть всі справи\n"
-        "2️⃣ Перейдіть до найближчого укриття або підвалу\n"
-        "3️⃣ Якщо укриття немає — ляжте біля несучої стіни\n"
-        "4️⃣ Тримайтесь подалі від вікон і скла\n"
-        "5️⃣ Вимкніть газ, електроприлади (якщо є час)\n"
-        "6️⃣ Візьміть документи, воду, ліки, телефон\n"
-        "7️⃣ Не виходьте з укриття до сигналу відбою\n"
-        "8️⃣ Не поширюйте паніку — допоможіть іншим\n\n"
-        "🏃 Після вибуху поблизу:\n"
-        "• Ляжте на підлогу, прикрийте голову\n"
-        "• Не підходьте до вікон\n"
+        "📜 ПРАВИЛА ПОВЕДІНКИ\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "1️⃣ Припиніть ВСЕ негайно\n"
+        "2️⃣ Перейдіть до укриття\n"
+        "3️⃣ Ляжте біля стіни\n"
+        "4️⃣ Подалі від вікон\n"
+        "5️⃣ Вимкніть газ\n"
+        "6️⃣ Візьміть документи\n"
+        "7️⃣ Не виходьте рано\n"
+        "8️⃣ Допоможіть іншим\n\n"
+        "🏃 ПІСЛЯ ВИБУХУ:\n"
+        "• Ляжте на підлогу\n"
+        "• Прикрийте голову\n"
         "• Чекайте рятувальників\n\n"
-        "🙏 Бережіть себе і близьких!"
+        "🙏 БЕРЕЖІТЬ СЕБЕ!"
     )
     msg = update.message or update.callback_query.message
     await msg.reply_text(text)
@@ -339,12 +351,13 @@ async def cmd_rules(update, ctx):
 async def cmd_contacts(update, ctx):
     if not await check_access(update): return
     text = (
-        "📍 Контакти СМТ Ямпіль:\n\n"
-        "🏛 Ямпільська селищна громада\n"
+        "📍 КОНТАКТИ ОТГ\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "🏛️ Ямпільська селищна громада\n"
         "   🌐 https://yampil-gmada.gov.ua/\n\n"
-        "📍 Адреса: м. Ямпіль, вул. Незалежності\n\n"
+        "📍 м. Ямпіль, вул. Незалежності\n\n"
         "🚨 Місцева поліція: 102\n"
-        "🏥 Швидка допомога: 103\n\n"
+        "🏥 Медицина: 103\n\n"
         "ℹ️ Уточнюйте контакти в місцевій адміністрації"
     )
     msg = update.message or update.callback_query.message
@@ -353,34 +366,84 @@ async def cmd_contacts(update, ctx):
 async def cmd_notifications(update, ctx):
     if not await check_access(update): return
     text = (
-        "🔔 Сповіщення:\n\n"
+        "🔔 СПОВІЩЕННЯ\n"
+        "━━━━━━━━━━━━━━\n\n"
         "✅ Ти отримуватимеш:\n"
-        "• Оголошення повітряної тривоги\n"
-        "• Відбій повітряної тривоги\n"
-        "• Важливі оголошення ОТГ\n\n"
-        "💡 Поради:\n"
-        "• Активуй звук для критичних сповіщень\n"
-        "• Не вимикай уведомлення бота\n"
-        "• Ділися інформацією з сусідами\n\n"
-        "📢 Підпишись: @yampilnews"
+        "• Оголошення тривоги\n"
+        "• Відбій тривоги\n"
+        "• Оголошення ОТГ\n\n"
+        "💡 ПОРАДИ:\n"
+        "• Активуй звук\n"
+        "• Не вимикай уведомлення\n"
+        "• Ділись інформацією\n\n"
+        "📢 @yampilnews"
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Перейти на канал", url="https://t.me/yampilnews")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 КАНАЛ", url="https://t.me/yampilnews")]])
     msg = update.message or update.callback_query.message
     await msg.reply_text(text, reply_markup=kb)
+
+async def cmd_ask_question(update, ctx):
+    if not await check_access(update): return
+    await update.callback_query.message.reply_text(
+        "❓ ПИТАННЯ АДМІНІСТРАЦІЇ\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Напиши своє питання, і адміністрація відповість тобі найскоріше.\n\n"
+        "/ask_question <текст>"
+    )
+
+async def cmd_ask(update, ctx):
+    if not await check_access(update): return
+    text = " ".join(ctx.args)
+    if not text:
+        await update.message.reply_text(
+            "❓ Використання: /ask_question <твоє питання>\n\n"
+            "Приклад:\n/ask_question Де найближче укриття?"
+        )
+        return
+    
+    uid = update.effective_user.id
+    name = user_name(update)
+    
+    questions = load_questions()
+    questions.append({
+        "user_id": uid,
+        "name": name,
+        "text": text,
+        "time": now_str()
+    })
+    save_questions(questions)
+    
+    await update.message.reply_text(
+        "✅ ПИТАННЯ ОТРИМАНО!\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "Адміністрація скоро відповість на твоє питання."
+    )
+    
+    # Надсилаємо адміну
+    for admin_id in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(
+                chat_id=admin_id,
+                text=f"❓ НОВЕ ПИТАННЯ\n\n👤 {name} ({uid})\n📝 {text}\n\n🕐 {now_str()}"
+            )
+        except:
+            pass
 
 async def cmd_about(update, ctx):
     if not await check_access(update): return
     text = (
-        "ℹ️ Про бота:\n\n"
-        "🤖 Бот моніторингу повітряних тривог\n"
-        "📍 СМТ Ямпіль, Шепетівський р-н\n"
+        "ℹ️ ПРО БОТА\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🤖 Бот моніторингу тривог\n"
+        "📍 СМТ Ямпіль\n"
+        "   Шепетівський р-н\n"
         "   Хмельницька область\n\n"
-        "⚡️ Що вмію:\n"
-        "• Слідкую за тривогами 24/7\n"
-        "• Публікую в канал автоматично\n"
-        "• Показую мапу тривог України\n"
-        "• Повідомляю про всі тривоги по Україні\n"
-        "• Реєстрація користувачів\n\n"
+        "⚡ МОЖЛИВОСТІ:\n"
+        "✅ Моніторинг 24/7\n"
+        "✅ Автопубліка в канал\n"
+        "✅ Живі карти тривог\n"
+        "✅ Реєстрація користувачів\n"
+        "✅ Питання адміністрації\n\n"
         f"⏱ Аптайм: {uptime_str()}\n"
         f"🚨 Тривог: {bot_stats['alerts_count']}\n"
         f"📨 Повідомлень: {bot_stats['messages_sent']}\n\n"
@@ -391,81 +454,67 @@ async def cmd_about(update, ctx):
     msg = update.message or update.callback_query.message
     await msg.reply_text(text)
 
-async def cmd_bot_stats(update, ctx):
-    if not await check_access(update): return
-    text = (
-        "📊 СТАТИСТИКА РОБОТИ БОТА:\n\n"
-        f"⏱ Аптайм: {uptime_str()}\n"
-        f"🚨 Активацій тривоги: {bot_stats['alerts_count']}\n"
-        f"✅ Відбоїв: {bot_stats['allclear_count']}\n"
-        f"📨 Повідомлень в канал: {bot_stats['messages_sent']}\n"
-        f"👥 Зареєстровано: {len(registered_users)}\n\n"
-        f"🟢 API статус: онлайн\n\n"
-        "Дякуємо за користування ботом! 🙏"
-    )
-    await update.message.reply_text(text)
-
 async def cmd_help(update, ctx):
     if not await check_access(update): return
     text = (
-        "📋 Всі команди:\n\n"
-        "🔹 Основні:\n"
-        "/start — головне меню\n"
-        "/status — статус тривоги зараз\n"
-        "/map — мапа тривог України\n"
-        "/alerts\\_ua — список тривог по Україні\n\n"
-        "🔹 Інформація:\n"
-        "/shelters — найближчі укриття\n"
-        "/emergency — екстрені телефони\n"
-        "/rules — правила під час тривоги\n"
-        "/contacts — контакти ОТГ\n"
-        "/notifications — про сповіщення\n"
-        "/bot\\_stats — статистика бота\n"
-        "/about — про бота\n\n"
-        "🔹 Облік:\n"
+        "📋 ВСІ КОМАНДИ\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "/start — меню\n"
+        "/status — статус\n"
+        "/map — карти\n"
+        "/shelters — укриття\n"
+        "/emergency — номери\n"
+        "/rules — правила\n"
+        "/contacts — контакти\n"
+        "/ask_question — питання\n"
+        "/about — про бота\n"
+        "/help — цей список\n"
         "/register — реєстрація\n"
-        "/myid — твій Telegram ID\n\n"
-        "🔐 Адміністрування:\n"
-        "/admin — панель адміністратора\n"
-        "/post <текст> — опублікувати в канал\n"
-        "/ban <id> — заблокувати\n"
-        "/unban <id> — розблокувати\n"
+        "/myid — твій ID\n"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text)
 
 async def cmd_myid(update, ctx):
-    uid  = update.effective_user.id
+    uid = update.effective_user.id
     name = user_name(update)
     role = "🔐 Адміністратор" if is_admin(update) else ("✅ Зареєстрований" if is_registered(uid) else "❌ Не зареєстрований")
-    await update.message.reply_text(f"👤 {name}\n🆔 ID: `{uid}`\n{role}", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"👤 {name}\n🆔 ID: `{uid}`\n\n{role}",
+        parse_mode="Markdown"
+    )
 
 async def cmd_admin(update, ctx):
     if not is_admin(update):
-        await update.message.reply_text("🚫 У вас немає прав адміністратора.")
+        await update.message.reply_text("🚫 Немає прав.")
         return
+    
     name = user_name(update)
+    questions = load_questions()
+    
     text = (
-        f"🔐 ПАНЕЛЬ АДМІНІСТРАТОРА\n{'='*30}\n\n"
+        f"🔐 ПАНЕЛЬ АДМІНІСТРАТОРА\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 {name}\n🕐 {now_str()}\n\n"
         f"📊 СТАТУС:\n"
-        f"{'🔴 ТРИВОГА' if alert_active else '🟢 СПОКІЙНО'}\n"
+        f"{'🔴 ТРИВОГА!' if alert_active else '🟢 СПОКІЙНО'}\n"
         f"⏱ Аптайм: {uptime_str()}\n\n"
         f"📈 СТАТИСТИКА:\n"
         f"🚨 Тривог: {bot_stats['alerts_count']}\n"
         f"✅ Відбоїв: {bot_stats['allclear_count']}\n"
         f"📨 Повідомлень: {bot_stats['messages_sent']}\n"
         f"👥 Користувачів: {len(registered_users)}\n"
-        f"🚫 Заблокованих: {len(banned_users)}"
+        f"🚫 Заблокованих: {len(banned_users)}\n"
+        f"❓ Нових питань: {len(questions)}"
     )
+    
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Оголошення в канал",  callback_data="admin_post_prompt")],
-        [InlineKeyboardButton("🚨 Тестова тривога",     callback_data="admin_test_alert"),
-         InlineKeyboardButton("✅ Тестовий відбій",     callback_data="admin_test_clear")],
-        [InlineKeyboardButton("👥 Користувачі",         callback_data="admin_list"),
-         InlineKeyboardButton("📊 Деталі",              callback_data="admin_details")],
-        [InlineKeyboardButton("🚫 /ban <id>",           callback_data="admin_ban"),
-         InlineKeyboardButton("🔓 /unban <id>",         callback_data="admin_unban")],
-        [InlineKeyboardButton("🔙 Закрити",             callback_data="admin_close")],
+        [InlineKeyboardButton("📢 Оголошення",        callback_data="admin_post")],
+        [InlineKeyboardButton("🚨 Тест тривога",      callback_data="admin_test_alert"),
+         InlineKeyboardButton("✅ Тест відбій",       callback_data="admin_test_clear")],
+        [InlineKeyboardButton("👥 Користувачі",       callback_data="admin_list"),
+         InlineKeyboardButton("❓ Питання",           callback_data="admin_questions")],
+        [InlineKeyboardButton("🚫 /ban <id>",         callback_data="admin_ban"),
+         InlineKeyboardButton("🔓 /unban <id>",       callback_data="admin_unban")],
     ])
     await update.message.reply_text(text, reply_markup=kb)
 
@@ -475,17 +524,17 @@ async def cmd_post(update, ctx):
         return
     text = " ".join(ctx.args)
     if not text:
-        await update.message.reply_text("✍️ Використання: /post <текст>")
+        await update.message.reply_text("✍️ /post <текст>")
         return
-    await post_to_channel(ctx.bot, f"📢 Оголошення:\n\n{text}\n\n🕐 {now_str()}")
-    await update.message.reply_text("✅ Опубліковано в канал!")
+    await post_to_channel(ctx.bot, f"📢 ОГОЛОШЕННЯ\n━━━━━━━━━━\n\n{text}\n\n🕐 {now_str()}")
+    await update.message.reply_text("✅ Опубліковано!")
 
 async def cmd_ban(update, ctx):
     if not is_admin(update):
         await update.message.reply_text("🚫 Немає прав.")
         return
     if not ctx.args or not ctx.args[0].isdigit():
-        await update.message.reply_text("Використання: /ban <user_id>")
+        await update.message.reply_text("/ban <user_id>")
         return
     uid = int(ctx.args[0])
     ban_user(uid)
@@ -496,7 +545,7 @@ async def cmd_unban(update, ctx):
         await update.message.reply_text("🚫 Немає прав.")
         return
     if not ctx.args or not ctx.args[0].isdigit():
-        await update.message.reply_text("Використання: /unban <user_id>")
+        await update.message.reply_text("/unban <user_id>")
         return
     uid = int(ctx.args[0])
     unban_user(uid)
@@ -506,7 +555,7 @@ async def cmd_unban(update, ctx):
 async def button_handler(update, ctx):
     query = update.callback_query
     await query.answer()
-    data  = query.data
+    data = query.data
 
     if   data == "status":        await cmd_status(update, ctx)
     elif data == "map":           await cmd_map(update, ctx)
@@ -515,58 +564,60 @@ async def button_handler(update, ctx):
     elif data == "rules":         await cmd_rules(update, ctx)
     elif data == "contacts":      await cmd_contacts(update, ctx)
     elif data == "notifications": await cmd_notifications(update, ctx)
+    elif data == "ask_question":  await cmd_ask_question(update, ctx)
     elif data == "about":         await cmd_about(update, ctx)
-
-    elif data == "admin_post_prompt":
+    
+    elif data == "admin_post":
         if not is_admin(update): return
-        await query.message.reply_text("✍️ Введи: /post <текст>")
-
+        await query.message.reply_text("✍️ /post <текст>")
+    
     elif data == "admin_test_alert":
         if not is_admin(update): return
         await post_to_channel(ctx.bot,
-            f"‼️УВАГА ПОВІТРЯНА ТРИВОГА‼️\n\n"
-            f"Станом на {now_str()}, в ОТГ селища Ямпіль, "
-            f"була оголошена повітряна тривога.\n\nБЕРЕЖІТЬ СЕБЕ!\n\n"
+            f"‼️ УВАГА! ТРИВОГА!\n━━━━━━━━━━━━━━━\n\n"
+            f"Станом на {now_str()}, в ОТГ селища Ямпіль\n"
+            f"ОГОЛОШЕНА ПОВІТРЯНА ТРИВОГА!\n\n"
+            f"⚠️ ПРОШУ ПРОЙТИ ДО УКРИТТЯ!\n"
+            f"🙏 БЕРЕЖІТЬ СЕБЕ!\n\n"
             f"🔧 [ТЕСТОВЕ ПОВІДОМЛЕННЯ]")
-        await query.message.reply_text("✅ Тестова тривога надіслана.")
-
+        await query.message.reply_text("✅ Надіслано!")
+    
     elif data == "admin_test_clear":
         if not is_admin(update): return
         await post_to_channel(ctx.bot,
-            f"❕ВІДБІЙ ПОВІТРЯНОЇ ТРИВОГИ❕\n\n"
-            f"Станом на {now_str()} був оголошений відбій.\n\n"
+            f"✅ ВІДБІЙ!\n━━━━━━━━━━\n\n"
+            f"Станом на {now_str()} був оголошений\n"
+            f"ВІДБІЙ ПОВІТРЯНОЇ ТРИВОГИ.\n\n"
+            f"🟢 СПОКІЙНО\n\n"
             f"🔧 [ТЕСТОВЕ ПОВІДОМЛЕННЯ]")
-        await query.message.reply_text("✅ Тестовий відбій надіслано.")
-
+        await query.message.reply_text("✅ Надіслано!")
+    
     elif data == "admin_list":
         if not is_admin(update): return
         await query.message.reply_text(
-            f"👥 Зареєстровано: {len(registered_users)}\n"
+            f"👥 КОРИСТУВАЧІ\n"
+            f"━━━━━━━━━━━━━━━\n\n"
+            f"✅ Зареєстровано: {len(registered_users)}\n"
             f"🚫 Заблокованих: {len(banned_users)}")
-
-    elif data == "admin_details":
+    
+    elif data == "admin_questions":
         if not is_admin(update): return
-        await query.message.reply_text(
-            f"📊 Деталі:\n\n"
-            f"⏱ Аптайм: {uptime_str()}\n"
-            f"🚨 Тривог: {bot_stats['alerts_count']}\n"
-            f"✅ Відбоїв: {bot_stats['allclear_count']}\n"
-            f"📨 Повідомлень: {bot_stats['messages_sent']}\n"
-            f"👥 Користувачів: {len(registered_users)}\n"
-            f"🌐 Канал: @yampilnews\n"
-            f"📍 Регіон ID: {TARGET_REGION_ID}")
-
+        questions = load_questions()
+        if not questions:
+            await query.message.reply_text("❓ Питань немає")
+            return
+        text = "❓ ПИТАННЯ:\n━━━━━━━━━━━\n\n"
+        for q in questions[-5:]:
+            text += f"👤 {q['name']}\n📝 {q['text']}\n🕐 {q['time']}\n\n"
+        await query.message.reply_text(text)
+    
     elif data == "admin_ban":
         if not is_admin(update): return
-        await query.message.reply_text("🚫 Введи: /ban <user_id>")
-
+        await query.message.reply_text("🚫 /ban <user_id>")
+    
     elif data == "admin_unban":
         if not is_admin(update): return
-        await query.message.reply_text("🔓 Введи: /unban <user_id>")
-
-    elif data == "admin_close":
-        if not is_admin(update): return
-        await query.message.delete()
+        await query.message.reply_text("🔓 /unban <user_id>")
 
 # ─── ALERT LOOP ────────────────────────────────────────────────────────────────
 async def alert_check_loop(bot, session):
@@ -582,22 +633,28 @@ async def alert_check_loop(bot, session):
                 alert_active = True
                 bot_stats["alerts_count"] += 1
                 await post_to_channel(bot,
-                    f"‼️УВАГА ПОВІТРЯНА ТРИВОГА‼️\n\n"
-                    f"Станом на {now_str()}, в ОТГ селища Ямпіль, "
-                    f"була оголошена повітряна тривога.\n\nБЕРЕЖІТЬ СЕБЕ!")
+                    f"‼️ УВАГА! ТРИВОГА!\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"Станом на {now_str()}, в ОТГ селища Ямпіль\n"
+                    f"ОГОЛОШЕНА ПОВІТРЯНА ТРИВОГА!\n\n"
+                    f"⚠️ ПРОШУ ПРОЙТИ ДО УКРИТТЯ!\n"
+                    f"🙏 БЕРЕЖІТЬ СЕБЕ!")
                 try:
                     await bot.send_photo(chat_id=CHANNEL_ID, photo=MAP_IMAGE_URL,
-                                        caption=f"🗺 Мапа тривог | {now_str()}\n{MAP_URL}")
+                                        caption=f"🗺️ ЖИВІ КАРТИ ТРИВОГ\n━━━━━━━━━━━━━━\n\n🕐 {now_str()}\n\n{MAP_URL}")
                 except Exception as e:
-                    log.warning("Не вдалось надіслати мапу: %s", e)
+                    log.warning("Помилка із картою: %s", e)
             elif not current and alert_active:
                 alert_active = False
                 bot_stats["allclear_count"] += 1
                 await post_to_channel(bot,
-                    f"❕ВІДБІЙ ПОВІТРЯНОЇ ТРИВОГИ❕\n\n"
-                    f"Станом на {now_str()} був оголошений відбій повітряної тривоги.")
+                    f"✅ ВІДБІЙ!\n"
+                    f"━━━━━━━━━━━━━━━\n\n"
+                    f"Станом на {now_str()} був оголошений\n"
+                    f"ВІДБІЙ ПОВІТРЯНОЇ ТРИВОГИ.\n\n"
+                    f"🟢 СПОКІЙНО")
         except Exception as e:
-            log.error("Alert loop error: %s", e)
+            log.error("Alert loop помилка: %s", e)
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ─── WEBHOOK + HTTP ────────────────────────────────────────────────────────────
@@ -610,7 +667,7 @@ async def handle_webhook(request):
         await tg_app.process_update(update)
         return web.Response(status=200)
     except Exception as e:
-        log.error("Webhook error: %s", e)
+        log.error("Webhook помилка: %s", e)
         return web.Response(status=500)
 
 async def health_check(request):
@@ -634,23 +691,22 @@ async def main():
     )
 
     tg_app.add_handler(conv_handler)
-    tg_app.add_handler(CommandHandler("start",         cmd_start))
-    tg_app.add_handler(CommandHandler("status",        cmd_status))
-    tg_app.add_handler(CommandHandler("map",           cmd_map))
-    tg_app.add_handler(CommandHandler("alerts_ua",     cmd_alerts_ua))
-    tg_app.add_handler(CommandHandler("shelters",      cmd_shelters))
-    tg_app.add_handler(CommandHandler("emergency",     cmd_emergency))
-    tg_app.add_handler(CommandHandler("rules",         cmd_rules))
-    tg_app.add_handler(CommandHandler("contacts",      cmd_contacts))
-    tg_app.add_handler(CommandHandler("notifications", cmd_notifications))
-    tg_app.add_handler(CommandHandler("about",         cmd_about))
-    tg_app.add_handler(CommandHandler("bot_stats",     cmd_bot_stats))
-    tg_app.add_handler(CommandHandler("help",          cmd_help))
-    tg_app.add_handler(CommandHandler("myid",          cmd_myid))
-    tg_app.add_handler(CommandHandler("admin",         cmd_admin))
-    tg_app.add_handler(CommandHandler("post",          cmd_post))
-    tg_app.add_handler(CommandHandler("ban",           cmd_ban))
-    tg_app.add_handler(CommandHandler("unban",         cmd_unban))
+    tg_app.add_handler(CommandHandler("start",           cmd_start))
+    tg_app.add_handler(CommandHandler("status",          cmd_status))
+    tg_app.add_handler(CommandHandler("map",             cmd_map))
+    tg_app.add_handler(CommandHandler("shelters",        cmd_shelters))
+    tg_app.add_handler(CommandHandler("emergency",       cmd_emergency))
+    tg_app.add_handler(CommandHandler("rules",           cmd_rules))
+    tg_app.add_handler(CommandHandler("contacts",        cmd_contacts))
+    tg_app.add_handler(CommandHandler("notifications",   cmd_notifications))
+    tg_app.add_handler(CommandHandler("ask_question",    cmd_ask))
+    tg_app.add_handler(CommandHandler("about",           cmd_about))
+    tg_app.add_handler(CommandHandler("help",            cmd_help))
+    tg_app.add_handler(CommandHandler("myid",            cmd_myid))
+    tg_app.add_handler(CommandHandler("admin",           cmd_admin))
+    tg_app.add_handler(CommandHandler("post",            cmd_post))
+    tg_app.add_handler(CommandHandler("ban",             cmd_ban))
+    tg_app.add_handler(CommandHandler("unban",           cmd_unban))
     tg_app.add_handler(CallbackQueryHandler(button_handler))
 
     await tg_app.initialize()
@@ -658,14 +714,11 @@ async def main():
     async with aiohttp.ClientSession() as session:
         tg_app.bot_data["session"] = session
 
-        # Встановлюємо webhook
         await tg_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
         log.info(f"Webhook: {WEBHOOK_URL}")
 
-        # Alert loop
         asyncio.create_task(alert_check_loop(tg_app.bot, session))
 
-        # HTTP сервер
         http_app = web.Application()
         http_app.router.add_post(WEBHOOK_PATH, handle_webhook)
         http_app.router.add_get("/health", health_check)
@@ -676,8 +729,8 @@ async def main():
         site = web.TCPSite(runner, "0.0.0.0", PORT)
         await site.start()
 
-        log.info(f"Сервер запущено на порту {PORT}")
-        log.info(f"Адмінів: {len(ADMIN_IDS)}, Зареєстровано: {len(registered_users)}")
+        log.info(f"🚀 Сервер на порту {PORT}")
+        log.info(f"👥 Адмінів: {len(ADMIN_IDS)}, Користувачів: {len(registered_users)}")
 
         await asyncio.Event().wait()
 
