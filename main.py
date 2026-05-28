@@ -28,7 +28,7 @@ PORT              = int(os.getenv("PORT", 10000))
 WEBHOOK_PATH      = "/webhook"
 WEBHOOK_URL       = f"{RENDER_URL}{WEBHOOK_PATH}"
 
-ALERT_API_URL     = "https://api.ukrainealarm.com/api/v3/active_alarms"
+ALERT_API_URL     = "https://api.ukrainealarm.com/api/v3/alerts"
 TARGET_REGION     = "Хмельницька"
 CHECK_INTERVAL    = 30
 KYIV_TZ           = timezone(timedelta(hours=3))
@@ -237,8 +237,7 @@ def kb_admin():
 async def fetch_alarm(session: aiohttp.ClientSession) -> bool:
     try:
         headers = {
-            "Authorization": f"Bearer {ALERT_API_KEY}",
-            "Content-Type": "application/json"
+            "Authorization": ALERT_API_KEY,
         }
         async with session.get(
             ALERT_API_URL,
@@ -247,9 +246,16 @@ async def fetch_alarm(session: aiohttp.ClientSession) -> bool:
         ) as r:
             if r.status == 200:
                 data = await r.json()
-                for alarm in data:
-                    if TARGET_REGION in alarm.get("region", ""):
-                        return True
+                # data — список регіонів, кожен має activeAlerts
+                for region in data:
+                    active = region.get("activeAlerts", [])
+                    if active:
+                        # Перевіряємо чи є тривога в Хмельницькій
+                        reg_name = region.get("regionName", "")
+                        if TARGET_REGION in reg_name:
+                            for alert in active:
+                                if alert.get("type") == "AIR":
+                                    return True
                 return False
             log.error("API відповів: %s", r.status)
             return alert_active or False
@@ -675,8 +681,190 @@ async def cmd_unban(update, ctx):
     await update.message.reply_text(f"✅ Користувач {uid} розблокований.")
 
 # ════════════════════════════════════════════
-#           ОБРОБКА КНОПОК
+#           НОВІ КОМАНДИ
 # ════════════════════════════════════════════
+async def cmd_danger(update, ctx):
+    if not await gate(update): return
+    session = ctx.bot_data.get("session")
+    uid = update.effective_user.id
+    rid, rname = get_user_region(uid)
+    try:
+        headers = {"Authorization": ALERT_API_KEY}
+        async with session.get(
+            ALERT_API_URL, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                threats = []
+                for region in data:
+                    if TARGET_REGION in region.get("regionName", ""):
+                        for alert in region.get("activeAlerts", []):
+                            t = alert.get("type", "")
+                            if t == "AIR":        threats.append("✈️ Авіаційна загроза")
+                            elif t == "ARTILLERY": threats.append("💥 Артилерія")
+                            elif t == "URBAN":    threats.append("🏙 Міські бої")
+                            elif t == "CHEMICAL": threats.append("☢️ Хімічна небезпека")
+                            else:                 threats.append(f"⚠️ {t}")
+                if threats:
+                    msg = f"⚠️ ПОТОЧНІ ЗАГРОЗИ\n══════════════════\n\n📍 {rname}\n🕐 {now_str()}\n\n" + "\n".join(threats)
+                else:
+                    msg = f"✅ ЗАГРОЗ НЕ ВИЯВЛЕНО\n══════════════════════\n\n📍 {rname}\n🕐 {now_str()}"
+            else:
+                msg = "❌ Не вдалось отримати дані."
+    except Exception as e:
+        log.error("danger: %s", e)
+        msg = "❌ Помилка при отриманні даних."
+    await update.message.reply_text(msg)
+
+async def cmd_history(update, ctx):
+    if not await gate(update): return
+    hist = _load("/tmp/alert_history.json", [])
+    if not hist:
+        await update.message.reply_text(
+            "📜 ІСТОРІЯ ТРИВОГ\n══════════════════\n\nПоки що тривог не зафіксовано."
+        )
+        return
+    msg = "📜 ОСТАННІ ТРИВОГИ\n══════════════════\n\n"
+    for i, h in enumerate(hist[-10:], 1):
+        icon = "🔴" if h["type"] == "alert" else "✅"
+        msg += f"{i}. {icon} {h['text']}\n   🕐 {h['time']}\n\n"
+    await update.message.reply_text(msg)
+
+async def cmd_pharmacy(update, ctx):
+    if not await gate(update): return
+    msg = (
+        "💊 АПТЕКИ В СМТ ЯМПІЛЬ\n"
+        "══════════════════════\n\n"
+        "① Аптека №1\n"
+        "   📍 вул. Центральна\n"
+        "   🕐 Пн-Пт: 08:00–18:00\n"
+        "   🕐 Сб: 09:00–14:00\n\n"
+        "② Аптека №2\n"
+        "   📍 вул. Незалежності\n"
+        "   🕐 Пн-Пт: 08:00–19:00\n\n"
+        "③ Аптека №3\n"
+        "   📍 вул. Шкільна\n"
+        "   🕐 Пн-Нд: 08:00–20:00\n\n"
+        "═══════════════════════\n"
+        "ℹ️ Уточнюйте години роботи\n"
+        "📞 Швидка: 103"
+    )
+    await update.message.reply_text(msg)
+
+async def cmd_schedule(update, ctx):
+    if not await gate(update): return
+    msg = (
+        "🏛 РОЗКЛАД УСТАНОВ\n"
+        "════════════════════\n\n"
+        "🏛 ОТГ Адміністрація\n"
+        "   📍 вул. Незалежності\n"
+        "   🕐 Пн-Пт: 08:00–17:00\n"
+        "   🕐 Обід: 12:00–13:00\n\n"
+        "🏥 Амбулаторія\n"
+        "   📍 вул. Медична\n"
+        "   🕐 Пн-Пт: 07:30–19:00\n"
+        "   🕐 Сб: 08:00–14:00\n\n"
+        "🏫 Гімназія\n"
+        "   📍 вул. Шкільна, 1\n"
+        "   🕐 Пн-Пт: 08:00–17:00\n\n"
+        "📮 Укрпошта\n"
+        "   🕐 Пн-Пт: 09:00–17:00\n"
+        "   🕐 Сб: 09:00–14:00\n\n"
+        "🏦 ПриватБанк / Ощадбанк\n"
+        "   🕐 Пн-Пт: 09:00–18:00"
+    )
+    await update.message.reply_text(msg)
+
+async def cmd_transport(update, ctx):
+    if not await gate(update): return
+    msg = (
+        "🚌 ТРАНСПОРТ\n"
+        "═════════════\n\n"
+        "🚌 Ямпіль → Шепетівка\n"
+        "   🕐 07:00 | 09:30 | 12:00\n"
+        "   🕐 14:30 | 16:00 | 18:00\n\n"
+        "🚌 Шепетівка → Ямпіль\n"
+        "   🕐 08:00 | 10:30 | 13:00\n"
+        "   🕐 15:30 | 17:00 | 19:00\n\n"
+        "🚌 Ямпіль → Хмельницький\n"
+        "   🕐 06:30 | 11:00 | 15:00\n\n"
+        "🚌 Хмельницький → Ямпіль\n"
+        "   🕐 09:00 | 13:30 | 17:30\n\n"
+        "═══════════════════════\n"
+        "ℹ️ Розклад може змінюватись\n"
+        "Уточнюйте у перевізника"
+    )
+    await update.message.reply_text(msg)
+
+async def cmd_power(update, ctx):
+    if not await gate(update): return
+    msg = (
+        "⚡ ГРАФІК ВІДКЛЮЧЕНЬ\n"
+        "══════════════════════\n\n"
+        f"📍 СМТ Ямпіль | 🕐 {now_str()}\n\n"
+        "Черга 1 (вул. Центральна, Шкільна):\n"
+        "   ⚡ 06:00–10:00 | 18:00–22:00\n\n"
+        "Черга 2 (вул. Незалежності, Медична):\n"
+        "   ⚡ 10:00–14:00 | 22:00–02:00\n\n"
+        "Черга 3 (інші вулиці):\n"
+        "   ⚡ 14:00–18:00 | 02:00–06:00\n\n"
+        "═══════════════════════\n"
+        "ℹ️ Графік може змінюватись"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🌐 Офіційний графік", url="https://oblenergo.km.ua"),
+    ]])
+    await update.message.reply_text(msg, reply_markup=kb)
+
+async def cmd_broadcast(update, ctx):
+    if not is_admin(update):
+        await update.message.reply_text("🚫 Немає прав.")
+        return
+    text = " ".join(ctx.args).strip()
+    if not text:
+        await update.message.reply_text(
+            "📣 Використання:\n/broadcast <текст>\n\n"
+            f"Буде надіслано {len(registered)} користувачам."
+        )
+        return
+    sent = 0
+    failed = 0
+    for uid in list(registered):
+        try:
+            await ctx.bot.send_message(
+                chat_id=uid,
+                text=f"📣 ПОВІДОМЛЕННЯ\n══════════════\n\n{text}\n\n🕐 {now_str()}"
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    await update.message.reply_text(
+        f"✅ РОЗСИЛКУ ЗАВЕРШЕНО\n══════════════════\n\n"
+        f"📨 Надіслано: {sent}\n❌ Помилок: {failed}"
+    )
+
+async def cmd_stats(update, ctx):
+    if not is_admin(update):
+        await update.message.reply_text("🚫 Немає прав.")
+        return
+    hist = _load("/tmp/alert_history.json", [])
+    msg = (
+        f"📊 ДЕТАЛЬНА СТАТИСТИКА\n"
+        f"══════════════════════\n\n"
+        f"⏱ Аптайм: {uptime()}\n"
+        f"🕐 Час: {now_str()}\n\n"
+        f"🚨 Тривог (сесія): {stats['alerts']}\n"
+        f"✅ Відбоїв (сесія): {stats['allclear']}\n"
+        f"📜 Тривог (всього): {sum(1 for h in hist if h.get('type')=='alert')}\n\n"
+        f"📨 Повідомлень: {stats['messages']}\n"
+        f"👥 Зареєстровано: {len(registered)}\n"
+        f"🚫 Заблокованих: {len(banned)}\n\n"
+        f"📡 API: ukrainealarm.com\n"
+        f"🌍 Моніторинг: {TARGET_REGION}"
+    )
+    await update.message.reply_text(msg)
 async def btn(update, ctx):
     q = update.callback_query
     await q.answer()
@@ -792,6 +980,9 @@ async def alarm_loop(bot: Bot, session: aiohttp.ClientSession):
                 alert_active = True
                 stats["alerts"] += 1
                 log.info("🔴 ТРИВОГА!")
+                hist = _load("/tmp/alert_history.json", [])
+                hist.append({"type": "alert", "text": "Тривога оголошена", "time": now_str()})
+                _save("/tmp/alert_history.json", hist[-50:])
                 await send_channel(
                     bot,
                     f"‼️ ТРИВОГА!\n"
@@ -812,6 +1003,9 @@ async def alarm_loop(bot: Bot, session: aiohttp.ClientSession):
                 alert_active = False
                 stats["allclear"] += 1
                 log.info("✅ ВІДБІЙ!")
+                hist = _load("/tmp/alert_history.json", [])
+                hist.append({"type": "clear", "text": "Відбій тривоги", "time": now_str()})
+                _save("/tmp/alert_history.json", hist[-50:])
                 await send_channel(
                     bot,
                     f"✅ ВІДБІЙ!\n"
@@ -892,6 +1086,14 @@ async def main():
     tg_app.add_handler(CommandHandler("post",         cmd_post))
     tg_app.add_handler(CommandHandler("ban",          cmd_ban))
     tg_app.add_handler(CommandHandler("unban",        cmd_unban))
+    tg_app.add_handler(CommandHandler("danger",       cmd_danger))
+    tg_app.add_handler(CommandHandler("history",      cmd_history))
+    tg_app.add_handler(CommandHandler("pharmacy",     cmd_pharmacy))
+    tg_app.add_handler(CommandHandler("schedule",     cmd_schedule))
+    tg_app.add_handler(CommandHandler("transport",    cmd_transport))
+    tg_app.add_handler(CommandHandler("power",        cmd_power))
+    tg_app.add_handler(CommandHandler("broadcast",    cmd_broadcast))
+    tg_app.add_handler(CommandHandler("stats",        cmd_stats))
     tg_app.add_handler(CallbackQueryHandler(btn))
 
     await tg_app.initialize()
